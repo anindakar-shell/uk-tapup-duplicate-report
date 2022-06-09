@@ -21,11 +21,11 @@ const app = express();
 // });
 
 const client = new Pool({
-  host: 'ec2-52-50-55-241.eu-west-1.compute.amazonaws.com',
-  port: 5432,
-  user: 'u5i2d3bs6ncq3u',
-  password: 'pd8e4c1851f3fe19bbbccb88547feedd3495049d5d5d79eca1ba5574a451a9308',
-  database: 'dfeib2eljma0t3',
+  host: process.env.host,
+  port: process.env.port,
+  user: process.env.user,
+  password: process.env.password,
+  database: process.env.database,
   ssl: true,
   max: 300
 });
@@ -33,8 +33,8 @@ const client = new Pool({
 client.connect();
 
 app.get('/', async (req, res) => {
-  let startDate = '2021-06-01';
-  const finalDate = '2021-12-31';
+  let startDate = '2022-01-01';
+  const finalDate = '2022-05-31';
   const dayCharges = [];
   let finalCharges = [];
 
@@ -123,6 +123,9 @@ const loopAllVehicles = async ({
       vehicle
     });
 
+    // console.log('All transactions...');
+    // console.log(rows);
+
     if (rows.length > 1) {
       const overChanges = await loopAllTransactions({
         startDate,
@@ -145,7 +148,11 @@ const loopAllVehicles = async ({
 
 const getAllTransactions = async ({ startDate, endDate, vehicle }) => {
   try {
-    const query = `SELECT ol."id", ol."OrderId", ol."ServiceableObjectId", ol."serviceableObjectIdentifier", ol."volumeFilled",ol."price", ol."createdAt", ol."updatedAt", ol."settlementFileId", sf."filename", ol."completedDate", c."name", cn."vat" FROM
+    const query = `SELECT ol."id", ol."OrderId", ol."ServiceableObjectId", ol."serviceableObjectIdentifier", 
+    ol."volumeFilled",ol."price", ol."createdAt", ol."updatedAt", ol."settlementFileId", sf."filename", ol."completedDate", 
+    c."name", cn."vat", to_char(ol."createdAt", 'YYYY-MM-DD') as createDate, to_char(ol."createdAt", 'HH24:MI') as createTime,
+    o."CustomerLocationId", o."CustomerId", cn."timezone", ol."productId", ol."productName"
+    FROM
     public."OrderLines" ol
     left join 
     public."Orders" o
@@ -188,25 +195,51 @@ const loopAllTransactions = async ({
     const overChrages = [];
     let sumVolume = 0;
     let unitPrice = 0;
+    let contractFee = 0;
+    let contractDate = '';
+    let contractVehicle = '';
+    let contractCompany = '';
+
     console.log('----------------------------------------------------------------------------------------------------------');
 
     // Overcharge date 
-    overChargeDate = moment(moment(overChargeDate, 'YYYY-MM-DD').add(1, 'd')).format('YYYY-MM-DD')
+    overChargeDate = moment(moment(overChargeDate, 'YYYY-MM-DD').add(1, 'd')).format('YYYY-MM-DD');
     for (let j = i + 1; j <= transactions.length - 1; j++) {
-      if (transactions[j - 1].settlementFileId != transactions[j].settlementFileId) {       
-        console.log(overChargeDate, ' | Company: ', transactions[j].name, ' | Txn ID: ', transactions[j].id, ' | OrderId: ', transactions[j].OrderId, ' | License: ', transactions[j].serviceableObjectIdentifier, ' | Volume: ', transactions[j].volumeFilled, 'lt', ' | Unit Price: ', transactions[j].price, ' | File Id: ', transactions[j].settlementFileId, ' | File Name: ', transactions[j].filename);
+      if (transactions[j - 1].settlementFileId != transactions[j].settlementFileId) {
+        console.log(overChargeDate, transactions[j].createdate, transactions[j].createtime, ' | Company: ', transactions[j].name, ' | Txn ID: ', transactions[j].id, ' | OrderId: ', transactions[j].OrderId, ' | License: ', transactions[j].serviceableObjectIdentifier, ' | Volume: ', transactions[j].volumeFilled, 'lt', ' | Unit Price: ', transactions[j].price, ' | File Id: ', transactions[j].settlementFileId, ' | File Name: ', transactions[j].filename);
+
+        // Customer contract
+        const { rows, rowCount } = await getCustomerContracts(transactions[j].CustomerId);
+        // console.log('Customer contracts...');
+        // console.log(rows);
+
+        const customerContract = await filterCustomerContractWithRange(transactions[j], rows);
+        const discountAmount = (customerContract && (customerContract.ProductId === transactions[j].productId)) ? customerContract.discountAmount : 0;
+        contractFee = (customerContract && customerContract.serviceFee) ? new Decimal(customerContract.serviceFee).dividedBy(1000) : 0;
+        contractDate = transactions[j].createdate;
+        contractVehicle = transactions[j].serviceableObjectIdentifier;
+        contractCompany = transactions[j].name;
+
+        console.log('Customer discount...');
+        console.log(customerContract);
+        console.log(discountAmount);
 
         // add the volume
         sumVolume += transactions[j].volumeFilled;
         unitPrice = transactions[j].price;
 
-        let fuelFilledLt = new Decimal(transactions[j].volumeFilled).dividedBy(1000);
-        let unitPriceInPd = new Decimal(transactions[j].price).dividedBy(1000);
-        let txnPrice = new Decimal(fuelFilledLt).times(unitPriceInPd);
+        const countryVat = new Decimal(transactions[j].vat).add(1);
+        const fuelFilledLt = new Decimal(transactions[j].volumeFilled).dividedBy(1000);
+        const unitPriceInPd = new Decimal(transactions[j].price).dividedBy(1000);
+        const priceAfterDiscount = new Decimal(unitPriceInPd).add(discountAmount);
+        const unitPriceGross = new Decimal(priceAfterDiscount).times(countryVat);
+        const totalPrice = new Decimal(priceAfterDiscount).times(fuelFilledLt);
+        const totalPriceIncludingTax = new Decimal(totalPrice).times(countryVat);
 
         overChrages.push({
           companyName: transactions[j].name,
-          overChargeDate,
+          transactionCreateDate: transactions[j].createdate,
+          transactionCreateTime: transactions[j].createtime,
           transactionId: transactions[j].id,
           orderId: transactions[j].OrderId,
           licensePlate: transactions[j].serviceableObjectIdentifier,
@@ -214,13 +247,45 @@ const loopAllTransactions = async ({
           fuelFilledInLt: fuelFilledLt,
           unitPrice: transactions[j].price,
           unitPriceInPd: unitPriceInPd,
+          discountAmount,
+          countryVat,
+          priceAfterDiscount,
+          unitPriceGross,
+          totalPrice,
+          totalPriceIncludingTax,
+          serviceFee: "",
           settlementFileId: transactions[j].settlementFileId,
           settleFilename: transactions[j].filename,
+          overChargeDate,
         });
       }
     }
 
     if (sumVolume > 0) {
+      // For the service fee
+      overChrages.push({
+        companyName: contractCompany,
+        transactionCreateDate: contractDate,
+        transactionCreateTime: "",
+        transactionId: "",
+        orderId: "",
+        licensePlate: contractVehicle,
+        fuelFilled: "",
+        fuelFilledInLt: "",
+        unitPrice: "",
+        unitPriceInPd: "",
+        discountAmount: "",
+        countryVat: "",
+        priceAfterDiscount: "",
+        unitPriceGross: "",
+        totalPrice: "",
+        totalPriceIncludingTax: "",
+        serviceFee: contractFee,
+        settlementFileId: "",
+        settleFilename: "",
+        overChargeDate: "",
+      });
+
       totalVolumeCharged += sumVolume;
       let fuelLt = new Decimal(sumVolume);
       fuelLt = fuelLt.dividedBy(1000);
@@ -236,6 +301,28 @@ const loopAllTransactions = async ({
   console.log('----------------------------------------------------------------------------------------------------------');
 
   return extraData;
+}
+
+const getCustomerContracts = async (customerId) => {
+  try {
+    const query = `select cont."id", cont."startDate", cont."endDate", cont."priceType", 
+    ccpd."ProductId", ccpd."discountAmount", cont."serviceFee",
+    extract(epoch from cont."startDate") as startDateUx,
+    extract(epoch from cont."endDate") as endDateUx
+    from "Contracts" cont
+    left join
+    "CustomerContractProductDiscounts" ccpd on ccpd."contractId" = cont.id
+    WHERE cont."CustomerId" = ${customerId}`;
+    // console.log(`Query: ${query}`);
+
+    return client.query(query);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+const filterCustomerContractWithRange = async (transaction, contracts) => {
+  return contracts.find(c => (transaction.completedDate >= c.startdateux && transaction.completedDate <= c.enddateux));
 }
 
 // Not in use
